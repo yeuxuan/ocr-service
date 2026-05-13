@@ -98,7 +98,7 @@ else
         source "$PROJECT_DIR/.venv-sdk/bin/activate"
         pip install --upgrade pip
         pip install -e "$PROJECT_DIR/glm-ocr[layout]"
-        pip install fastapi uvicorn
+        pip install fastapi uvicorn python-multipart
     )
     ok "GLM-OCR SDK + FastAPI environment ready"
 fi
