@@ -1,0 +1,10 @@
+.venv-mlx/
+.venv-sdk/
+.pids/
+data/
+results/
+__pycache__/
+*.pyc
+*.log
+*.egg-info/
+.DS_Store
