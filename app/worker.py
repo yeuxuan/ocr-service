@@ -2,10 +2,9 @@ import asyncio
 import os
 import shutil
 import logging
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Callable
-
-from glmocr import parse
 
 from . import store
 
@@ -16,8 +15,8 @@ RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 OCR_TIMEOUT_IMAGE = int(os.environ.get("OCR_TIMEOUT_IMAGE", "300"))
 OCR_TIMEOUT_PDF = int(os.environ.get("OCR_TIMEOUT_PDF", "1800"))
-# PP-DocLayoutV3 (PyTorch) 并发初始化存在 meta tensor 竞态，必须串行
-MAX_CONCURRENT = int(os.environ.get("OCR_MAX_CONCURRENT", "1"))
+# 进程级隔离：每个 worker 进程有独立的 PyTorch 布局模型，规避 meta tensor 竞态
+MAX_CONCURRENT = int(os.environ.get("OCR_MAX_CONCURRENT", "2"))
 
 _PDF_SUFFIXES = {".pdf"}
 
@@ -34,7 +33,23 @@ def _error_message(e: Exception) -> str:
     return f"{type(e).__name__}: {type(e).__doc__ or 'no details'}"
 
 
-async def _process_task(task: dict, on_update: Callable[[str], None]):
+def _parse_in_process(file_path: str, output_dir: str) -> dict:
+    """在独立 worker 进程中执行，拥有自己的布局模型副本。"""
+    from glmocr import parse
+
+    result = parse(file_path)
+    result.save(output_dir=output_dir)
+    return {
+        "markdown": result.markdown_result or "",
+        "json": result.json_result,
+    }
+
+
+async def _process_task(
+    task: dict,
+    on_update: Callable[[str], None],
+    pool: ProcessPoolExecutor,
+):
     task_id = task["task_id"]
     file_path = task["file_path"]
     file_name = task["file_name"]
@@ -46,17 +61,12 @@ async def _process_task(task: dict, on_update: Callable[[str], None]):
     on_update(task_id)
 
     try:
-        pipeline_result = await asyncio.wait_for(
-            asyncio.to_thread(parse, file_path),
+        loop = asyncio.get_running_loop()
+        result_data = await asyncio.wait_for(
+            loop.run_in_executor(pool, _parse_in_process, file_path, str(output_dir)),
             timeout=timeout,
         )
-        pipeline_result.save(output_dir=str(output_dir))
-
-        result_data = {
-            "markdown": pipeline_result.markdown_result or "",
-            "json": pipeline_result.json_result,
-            "file_name": file_name,
-        }
+        result_data["file_name"] = file_name
 
         store.complete_task(task_id, result_data)
         logger.info("Task %s completed", task_id)
@@ -74,13 +84,23 @@ async def _process_task(task: dict, on_update: Callable[[str], None]):
 
 
 async def worker_loop(on_update: Callable[[str], None] = lambda _: None):
-    logger.info("OCR worker started (max_concurrent=%d)", MAX_CONCURRENT)
+    logger.info("OCR worker started (max_concurrent=%d, process pool)", MAX_CONCURRENT)
+    pool = ProcessPoolExecutor(max_workers=MAX_CONCURRENT)
     sem = asyncio.Semaphore(MAX_CONCURRENT)
+    pending: set[asyncio.Task] = set()
 
-    while True:
-        task = await asyncio.to_thread(store.claim_next_pending)
-        if task:
-            async with sem:
-                await _process_task(task, on_update)
-        else:
-            await asyncio.sleep(1)
+    async def _run(task: dict):
+        async with sem:
+            await _process_task(task, on_update, pool)
+
+    try:
+        while True:
+            task = await asyncio.to_thread(store.claim_next_pending)
+            if task:
+                t = asyncio.create_task(_run(task))
+                pending.add(t)
+                t.add_done_callback(pending.discard)
+            else:
+                await asyncio.sleep(1)
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
