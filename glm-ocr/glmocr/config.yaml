@@ -104,8 +104,8 @@ pipeline:
     connection_pool_size: 128
 
   # Maximum parallel workers for region recognition
-  # M4 Max can handle more concurrent OCR calls
-  max_workers: 8
+  # M4 Max: OCR_MAX_CONCURRENT(3) × max_workers(6) = 18 concurrent MLX requests
+  max_workers: 6
   # Queue sizes
   page_maxsize: 100
   region_maxsize: 2000
@@ -117,7 +117,7 @@ pipeline:
     temperature: 0.0
     top_p: 0.00001
     top_k: 1
-    repetition_penalty: 1.1
+    repetition_penalty: 1.0
 
     # Image processing
     t_patch_size: 2
@@ -188,7 +188,7 @@ pipeline:
 
     # Processing
     # batch_size: max images per model forward pass (reduce to 1 if OOM)
-    batch_size: 4
+    batch_size: 8
     workers: 1
     cuda_visible_devices: "0"
     # Explicit device placement for the layout model.

@@ -14,8 +14,8 @@ MLX_LOG="$PROJECT_DIR/mlx-server.log"
 API_LOG="$PROJECT_DIR/api.log"
 
 # ---------- Tunable Parameters ----------
-export MLX_METAL_MEMORY_BUDGET=20000000000
-export OCR_MAX_CONCURRENT=2
+export MLX_METAL_MEMORY_BUDGET=24000000000
+export OCR_MAX_CONCURRENT=3
 
 MLX_SERVER_PORT=8080
 API_SERVER_PORT=5002
@@ -107,9 +107,9 @@ do_start() {
                 --model mlx-community/GLM-OCR-bf16 \
                 --port "$MLX_SERVER_PORT" \
                 --trust-remote-code \
-                --max-kv-size 16384 \
-                --vision-cache-size 100 \
-                --prefill-step-size 4096 \
+                --max-kv-size 32768 \
+                --vision-cache-size 200 \
+                --prefill-step-size 8192 \
                 --max-tokens 8192 \
                 --log-level INFO
         ) >> "$MLX_LOG" 2>&1 &

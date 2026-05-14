@@ -5,7 +5,7 @@ import shutil
 import logging
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Optional
 
 from . import store
 
@@ -19,6 +19,19 @@ OCR_TIMEOUT_PDF = int(os.environ.get("OCR_TIMEOUT_PDF", "1800"))
 MAX_CONCURRENT = int(os.environ.get("OCR_MAX_CONCURRENT", "2"))
 
 _PDF_SUFFIXES = {".pdf"}
+
+_glmocr_instance: Optional[object] = None
+_instance_poisoned: bool = False
+
+
+def _init_worker():
+    """每个 worker 进程启动时调用一次，预加载布局模型和 OCR 客户端。"""
+    global _glmocr_instance, _instance_poisoned
+    from glmocr import GlmOcr
+
+    _instance_poisoned = False
+    _glmocr_instance = GlmOcr()
+    logger.info("Worker process %d: pipeline initialized", os.getpid())
 
 
 def _timeout_for(file_name: str) -> int:
@@ -35,21 +48,34 @@ def _error_message(e: Exception) -> str:
 
 def _parse_in_process(file_path: str, output_dir: str, timeout: int) -> dict:
     """在独立 worker 进程中执行，SIGALRM 实现进程内超时。"""
+    global _glmocr_instance, _instance_poisoned
+
+    if _glmocr_instance is None:
+        raise RuntimeError("Worker process failed to initialize GlmOcr pipeline")
+
+    # SIGALRM 会中断 Pipeline 内部线程，导致实例状态不可靠，需要替换进程
+    if _instance_poisoned:
+        raise RuntimeError(
+            "Worker process is poisoned after prior timeout; "
+            "process will be replaced"
+        )
+
     def _on_alarm(signum, frame):
         raise TimeoutError(f"OCR timeout after {timeout}s")
 
     signal.signal(signal.SIGALRM, _on_alarm)
     signal.alarm(timeout)
     try:
-        from glmocr import parse
-
         Path(output_dir).mkdir(parents=True, exist_ok=True)
-        result = parse(file_path)
+        result = _glmocr_instance.parse(file_path)
         result.save(output_dir=output_dir)
         return {
             "markdown": result.markdown_result or "",
             "json": result.json_result,
         }
+    except TimeoutError:
+        _instance_poisoned = True
+        raise
     finally:
         signal.alarm(0)
 
@@ -98,7 +124,7 @@ async def _process_task(
 
 async def worker_loop(on_update: Callable[[str], None] = lambda _: None):
     logger.info("OCR worker started (max_concurrent=%d, process pool)", MAX_CONCURRENT)
-    pool = ProcessPoolExecutor(max_workers=MAX_CONCURRENT)
+    pool = ProcessPoolExecutor(max_workers=MAX_CONCURRENT, initializer=_init_worker)
     sem = asyncio.Semaphore(MAX_CONCURRENT)
 
     try:
@@ -111,6 +137,4 @@ async def worker_loop(on_update: Callable[[str], None] = lambda _: None):
                 sem.release()
                 await asyncio.sleep(1)
     finally:
-        for proc in pool._processes.values():
-            proc.terminate()
-        pool.shutdown(wait=False)
+        pool.shutdown(wait=False, cancel_futures=True)
