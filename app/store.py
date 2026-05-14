@@ -36,6 +36,9 @@ def _get_conn():
     conn.row_factory = sqlite3.Row
     try:
         yield conn
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -58,7 +61,7 @@ def reset_stale_processing():
     with _get_conn() as conn:
         conn.execute(
             "UPDATE tasks SET status = ? WHERE status = ?",
-            (TaskStatus.PENDING, TaskStatus.PROCESSING),
+            (TaskStatus.PENDING.value, TaskStatus.PROCESSING.value),
         )
         conn.commit()
 
@@ -69,10 +72,10 @@ def create_task(task_id: str, file_name: str, file_path: str) -> dict:
     with _get_conn() as conn:
         conn.execute(
             "INSERT INTO tasks (task_id, status, file_name, file_path, created_at) VALUES (?, ?, ?, ?, ?)",
-            (task_id, TaskStatus.PENDING, file_name, file_path, now),
+            (task_id, TaskStatus.PENDING.value, file_name, file_path, now),
         )
         conn.commit()
-    return {"task_id": task_id, "status": TaskStatus.PENDING, "created_at": now, "file_name": file_name}
+    return {"task_id": task_id, "status": TaskStatus.PENDING.value, "created_at": now, "file_name": file_name}
 
 
 def get_task(task_id: str) -> dict | None:
@@ -94,18 +97,18 @@ def claim_next_pending() -> dict | None:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             "SELECT * FROM tasks WHERE status = ? ORDER BY created_at LIMIT 1",
-            (TaskStatus.PENDING,),
+            (TaskStatus.PENDING.value,),
         ).fetchone()
         if not row:
             conn.execute("ROLLBACK")
             return None
         conn.execute(
             "UPDATE tasks SET status = ? WHERE task_id = ?",
-            (TaskStatus.PROCESSING, row["task_id"]),
+            (TaskStatus.PROCESSING.value, row["task_id"]),
         )
         conn.commit()
     task = dict(row)
-    task["status"] = TaskStatus.PROCESSING
+    task["status"] = TaskStatus.PROCESSING.value
     return task
 
 
@@ -115,7 +118,7 @@ def complete_task(task_id: str, result: dict):
     with _get_conn() as conn:
         conn.execute(
             "UPDATE tasks SET status = ?, result = ?, completed_at = ? WHERE task_id = ?",
-            (TaskStatus.COMPLETED, json.dumps(result, ensure_ascii=False), now, task_id),
+            (TaskStatus.COMPLETED.value, json.dumps(result, ensure_ascii=False), now, task_id),
         )
         conn.commit()
 
@@ -126,7 +129,7 @@ def fail_task(task_id: str, error: str):
     with _get_conn() as conn:
         conn.execute(
             "UPDATE tasks SET status = ?, error = ?, completed_at = ? WHERE task_id = ?",
-            (TaskStatus.FAILED, error, now, task_id),
+            (TaskStatus.FAILED.value, error, now, task_id),
         )
         conn.commit()
 

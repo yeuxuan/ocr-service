@@ -44,7 +44,7 @@ async def _unsubscribe(task_id: str, evt: asyncio.Event):
 def notify_task_update(task_id: str):
     subs = _subscribers.get(task_id)
     if subs:
-        for evt in subs:
+        for evt in list(subs):
             evt.set()
 
 
@@ -103,6 +103,7 @@ async def task_events_stream(task_id: str, request: Request):
 
     async def event_generator():
         evt = await _subscribe(task_id)
+        last_status = None
         try:
             while True:
                 if await request.is_disconnected():
@@ -110,7 +111,10 @@ async def task_events_stream(task_id: str, request: Request):
 
                 evt.clear()
                 current = await asyncio.to_thread(store.get_task, task_id)
-                yield _sse(current["status"], current)
+
+                if current["status"] != last_status:
+                    last_status = current["status"]
+                    yield _sse(current["status"], current)
 
                 if current["status"] in (TaskStatus.COMPLETED, TaskStatus.FAILED):
                     break

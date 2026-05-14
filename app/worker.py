@@ -1,5 +1,6 @@
 import asyncio
 import os
+import signal
 import shutil
 import logging
 from concurrent.futures import ProcessPoolExecutor
@@ -15,7 +16,6 @@ RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 OCR_TIMEOUT_IMAGE = int(os.environ.get("OCR_TIMEOUT_IMAGE", "300"))
 OCR_TIMEOUT_PDF = int(os.environ.get("OCR_TIMEOUT_PDF", "1800"))
-# 进程级隔离：每个 worker 进程有独立的 PyTorch 布局模型，规避 meta tensor 竞态
 MAX_CONCURRENT = int(os.environ.get("OCR_MAX_CONCURRENT", "2"))
 
 _PDF_SUFFIXES = {".pdf"}
@@ -33,22 +33,32 @@ def _error_message(e: Exception) -> str:
     return f"{type(e).__name__}: {type(e).__doc__ or 'no details'}"
 
 
-def _parse_in_process(file_path: str, output_dir: str) -> dict:
-    """在独立 worker 进程中执行，拥有自己的布局模型副本。"""
-    from glmocr import parse
+def _parse_in_process(file_path: str, output_dir: str, timeout: int) -> dict:
+    """在独立 worker 进程中执行，SIGALRM 实现进程内超时。"""
+    def _on_alarm(signum, frame):
+        raise TimeoutError(f"OCR timeout after {timeout}s")
 
-    result = parse(file_path)
-    result.save(output_dir=output_dir)
-    return {
-        "markdown": result.markdown_result or "",
-        "json": result.json_result,
-    }
+    signal.signal(signal.SIGALRM, _on_alarm)
+    signal.alarm(timeout)
+    try:
+        from glmocr import parse
+
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        result = parse(file_path)
+        result.save(output_dir=output_dir)
+        return {
+            "markdown": result.markdown_result or "",
+            "json": result.json_result,
+        }
+    finally:
+        signal.alarm(0)
 
 
 async def _process_task(
     task: dict,
     on_update: Callable[[str], None],
     pool: ProcessPoolExecutor,
+    sem: asyncio.Semaphore,
 ):
     task_id = task["task_id"]
     file_path = task["file_path"]
@@ -63,14 +73,16 @@ async def _process_task(
     try:
         loop = asyncio.get_running_loop()
         result_data = await asyncio.wait_for(
-            loop.run_in_executor(pool, _parse_in_process, file_path, str(output_dir)),
-            timeout=timeout,
+            loop.run_in_executor(
+                pool, _parse_in_process, file_path, str(output_dir), timeout
+            ),
+            timeout=timeout + 60,
         )
         result_data["file_name"] = file_name
 
         store.complete_task(task_id, result_data)
         logger.info("Task %s completed", task_id)
-    except asyncio.TimeoutError:
+    except (asyncio.TimeoutError, TimeoutError) as e:
         error = f"OCR timeout after {timeout}s for {file_name}"
         logger.error("Task %s timed out: %s", task_id, error)
         store.fail_task(task_id, error)
@@ -79,6 +91,7 @@ async def _process_task(
         logger.exception("Task %s failed: %s", task_id, error)
         store.fail_task(task_id, error)
     finally:
+        sem.release()
         on_update(task_id)
         shutil.rmtree(upload_dir, ignore_errors=True)
 
@@ -87,20 +100,17 @@ async def worker_loop(on_update: Callable[[str], None] = lambda _: None):
     logger.info("OCR worker started (max_concurrent=%d, process pool)", MAX_CONCURRENT)
     pool = ProcessPoolExecutor(max_workers=MAX_CONCURRENT)
     sem = asyncio.Semaphore(MAX_CONCURRENT)
-    pending: set[asyncio.Task] = set()
-
-    async def _run(task: dict):
-        async with sem:
-            await _process_task(task, on_update, pool)
 
     try:
         while True:
+            await sem.acquire()
             task = await asyncio.to_thread(store.claim_next_pending)
             if task:
-                t = asyncio.create_task(_run(task))
-                pending.add(t)
-                t.add_done_callback(pending.discard)
+                asyncio.create_task(_process_task(task, on_update, pool, sem))
             else:
+                sem.release()
                 await asyncio.sleep(1)
     finally:
-        pool.shutdown(wait=False, cancel_futures=True)
+        for proc in pool._processes.values():
+            proc.terminate()
+        pool.shutdown(wait=False)
